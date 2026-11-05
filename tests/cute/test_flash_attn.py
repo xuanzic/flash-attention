@@ -3583,6 +3583,149 @@ def test_flash_attn_hdim512_multi_kv_block_sm90(seqlen_q, seqlen_k, dtype, causa
     assert torch.equal(out, run()), "hdim 512 forward is not deterministic across launches"
 
 
+def test_flash_attn_sm90_k_chunks_selection():
+    """K head-dim chunking is only picked for hdim 512 on the TMA K/V overlap path."""
+    select = flash_attn_interface._sm90_k_chunks
+    default = dict(
+        paged_kv_non_tma=False,
+        use_block_sparsity=False,
+        intra_wg_overlap=True,
+        fp8_kv_dequant=False,
+    )
+    assert select(512, **default) == 4
+    for head_dim in (64, 128, 256, 384):
+        assert select(head_dim, **default) == 1
+    for flag, value in [
+        ("paged_kv_non_tma", True),
+        ("use_block_sparsity", True),
+        ("intra_wg_overlap", False),
+        ("fp8_kv_dequant", True),
+    ]:
+        assert select(512, **{**default, flag: value}) == 1, flag
+
+
+_HDIM512_K_CHUNK_CASES = [
+    # (dtype, causal, nheads_k, pack_gqa, kv_layout, seqlen_q, seqlen_k, num_splits)
+    pytest.param(torch.bfloat16, True, 2, None, "dense", 1000, 3001, 1, id="bf16-prefix-gqa"),
+    pytest.param(torch.bfloat16, False, 2, None, "dense", 333, 1000, 1, id="bf16-noncausal-gqa"),
+    pytest.param(torch.bfloat16, True, 2, None, "dense", 32, 50, 1, id="bf16-one-kv-block"),
+    pytest.param(torch.bfloat16, True, 2, None, "dense", 64, 70, 1, id="bf16-two-kv-blocks"),
+    pytest.param(torch.float16, True, 8, None, "dense", 512, 512, 1, id="fp16-causal-mha"),
+    pytest.param(torch.float16, False, 2, False, "dense", 200, 777, 1, id="fp16-noncausal-nopack"),
+    pytest.param(torch.bfloat16, True, 2, None, "paged", 1000, 3001, 1, id="bf16-paged-prefix"),
+    pytest.param(torch.bfloat16, False, 8, None, "paged", 64, 700, 1, id="bf16-paged-mha"),
+    pytest.param(torch.bfloat16, True, 2, None, "varlen", 1000, 3001, 1, id="bf16-varlen"),
+    pytest.param(torch.float16, False, 8, None, "varlen", 300, 900, 1, id="fp16-varlen-mha"),
+    pytest.param(torch.bfloat16, True, 2, None, "varlen_paged", 517, 4000, 1, id="bf16-varlen-pg"),
+    pytest.param(torch.bfloat16, True, 2, None, "dense", 1, 3001, 3, id="bf16-decode-split"),
+    pytest.param(torch.bfloat16, True, 2, None, "paged", 5, 3001, 4, id="bf16-decode-pg-split"),
+]
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 hdim 512 forward")
+@pytest.mark.parametrize(
+    "dtype,causal,nheads_k,pack_gqa,kv_layout,seqlen_q,seqlen_k,num_splits",
+    _HDIM512_K_CHUNK_CASES,
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hdim512_k_chunks_sm90(
+    monkeypatch, dtype, causal, nheads_k, pack_gqa, kv_layout, seqlen_q, seqlen_k, num_splits
+):
+    """SM90 hdim 512: loading and consuming K in 4 head-dim chunks must give bitwise the same
+    output and LSE as the unchunked K tile (the WGMMAs run in the same order), on every K/V
+    path that uses it, and be deterministic across launches."""
+    device, d, batch_size, nheads, page_size = "cuda", 512, 2, 8, 64
+    torch.random.manual_seed(0)
+    k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, _ = _generate_block_kvcache(
+        seqlen_k, page_size, batch_size, nheads_k, d, d, device, dtype, dtype
+    )
+    k_cache, v_cache = k_cache.contiguous(), v_cache.contiguous()
+    kwargs = dict(causal=causal, pack_gqa=pack_gqa, num_splits=num_splits, return_lse=True)
+    if kv_layout in ["dense", "paged"]:
+        seqlens_q, seqlens_k = [seqlen_q] * batch_size, [seqlen_k] * batch_size
+        q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+        if kv_layout == "dense":
+            kwargs.update(k=k_cache, v=v_cache)
+        else:
+            seqused_k = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=device)
+            kwargs.update(
+                k=k_cache_paged,
+                v=v_cache_paged,
+                page_table=page_table,
+                seqused_k=seqused_k,
+                max_seqlen_q=seqlen_q,
+                max_seqlen_k=seqlen_k,
+            )
+    else:
+        # Sequences of different lengths, the second one shorter in both q and k.
+        seqlens_q = [seqlen_q, max(1, seqlen_q // 3)]
+        seqlens_k = [seqlen_k, seqlen_k // 2 + 1]
+        q = torch.randn(sum(seqlens_q), nheads, d, device=device, dtype=dtype)
+        cu_seqlens_q = torch.tensor([0, *itertools.accumulate(seqlens_q)], dtype=torch.int32)
+        kwargs.update(cu_seqlens_q=cu_seqlens_q.to(device), max_seqlen_q=max(seqlens_q))
+        if kv_layout == "varlen":
+            k = torch.cat([k_cache[i, :n] for i, n in enumerate(seqlens_k)])
+            v = torch.cat([v_cache[i, :n] for i, n in enumerate(seqlens_k)])
+            cu_seqlens_k = torch.tensor([0, *itertools.accumulate(seqlens_k)], dtype=torch.int32)
+            kwargs.update(k=k, v=v, cu_seqlens_k=cu_seqlens_k.to(device))
+        else:
+            seqused_k = torch.tensor(seqlens_k, dtype=torch.int32, device=device)
+            kwargs.update(
+                k=k_cache_paged, v=v_cache_paged, page_table=page_table, seqused_k=seqused_k
+            )
+        kwargs.update(max_seqlen_k=max(seqlens_k))
+
+    # Fresh compile cache: k_chunks must select a different kernel.
+    cache = JITCache()
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", cache)
+    out_unchunked, lse_unchunked = _flash_attn_fwd(q, k_chunks=1, **kwargs)[:2]
+    out, lse = _flash_attn_fwd(q, k_chunks=4, **kwargs)[:2]
+    if is_fake_mode():
+        return
+    assert len(cache.cache) == 2
+    assert torch.isfinite(out).all() and torch.isfinite(lse).all()
+    assert torch.equal(out, out_unchunked), "K chunks changed the output"
+    assert torch.equal(lse, lse_unchunked), "K chunks changed the LSE"
+    out2, lse2 = _flash_attn_fwd(q, k_chunks=4, **kwargs)[:2]
+    assert torch.equal(out, out2) and torch.equal(lse, lse2), "K chunks are not deterministic"
+    # Per-sequence reference check, so that a bug shared with k_chunks=1 is caught too.
+    out_seqs = out.split(seqlens_q) if out.dim() == 3 else out.unbind(0)
+    for i, out_i in enumerate(out_seqs):
+        q_i = q[i] if q.dim() == 4 else q[sum(seqlens_q[:i]) : sum(seqlens_q[: i + 1])]
+        k_i, v_i = k_cache[i : i + 1, : seqlens_k[i]], v_cache[i : i + 1, : seqlens_k[i]]
+        out_ref, _ = attention_ref(q_i[None], k_i, v_i, causal=causal)
+        out_pt, _ = attention_ref(
+            q_i[None], k_i, v_i, causal=causal, upcast=False, reorder_ops=True
+        )
+        check_tensor_vs_ref("Output", out_i[None], out_ref, out_pt)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 hdim 512 forward")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hdim512_k_chunks_non_tma_paged_kv_sm90():
+    """The cp.async paged-KV path (page_size != tile_n) has no K-chunk producer: forcing
+    k_chunks is rejected, and the default falls back to the unchunked K tile."""
+    device, d, batch_size, nheads, nheads_k, seqlen_q, seqlen_k = "cuda", 512, 1, 8, 1, 64, 256
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=torch.bfloat16)
+    k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, _ = _generate_block_kvcache(
+        seqlen_k, 32, batch_size, nheads_k, d, d, device, torch.bfloat16, torch.bfloat16
+    )
+    kwargs = dict(
+        page_table=page_table,
+        seqused_k=torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=device),
+        causal=True,
+    )
+    with pytest.raises(AssertionError, match="requires TMA K/V loads"):
+        _flash_attn_fwd(q, k_cache_paged, v_cache_paged, k_chunks=4, **kwargs)
+    out = _flash_attn_fwd(q, k_cache_paged, v_cache_paged, **kwargs)[0]
+    if is_fake_mode():
+        return
+    out_ref, _ = attention_ref(q, k_cache, v_cache, causal=True)
+    out_pt, _ = attention_ref(q, k_cache, v_cache, causal=True, upcast=False, reorder_ops=True)
+    check_tensor_vs_ref("Output", out, out_ref, out_pt)
+
+
 def _run_fp8_paged_decode(q, k, v, page_size=128):
     """Run a single-sequence FP8 paged decode with unit descales."""
     seqlen_k, nheads_kv, d = k.shape

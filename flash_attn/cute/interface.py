@@ -177,6 +177,28 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
         tile_n = 64
         return FwdConfig(64, tile_n, False, True)
 
+
+def _sm90_k_chunks(
+    head_dim, paged_kv_non_tma, use_block_sparsity, intra_wg_overlap, fp8_kv_dequant
+):
+    """Number of head-dim chunks the SM90 forward loads and consumes the K tile in.
+
+    For head_dim 512 only one K/V stage fits in smem, so the next K tile can only be
+    loaded after QK has read the whole current one. 4 chunks with their own mbarriers let
+    QK start on the first chunk and refill each chunk as soon as it has been read. Only
+    on the TMA K/V path with intra-WG overlap; bitwise identical to 1 chunk.
+    """
+    if (
+        head_dim == 512
+        and not paged_kv_non_tma
+        and not use_block_sparsity
+        and intra_wg_overlap
+        and not fp8_kv_dequant
+    ):
+        return 4
+    return 1
+
+
 @dataclass(frozen=True)
 class BwdConfig:
     m_block_size: int
@@ -668,6 +690,7 @@ def _flash_attn_fwd(
     tile_mn: Optional[Tuple[int, int]] = None,
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
+    k_chunks: Optional[int] = None,
     num_threads: int = 384,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
@@ -716,6 +739,8 @@ def _flash_attn_fwd(
             page_size 64. Q is split into two E4M3 terms at a fixed scale of 1, so
             the caller must keep |q| <= 448: above 448 the error grows about 10x,
             and above 896 Q saturates silently. Fold larger Q into k_descale.
+        k_chunks: SM90 only. Number of head-dim chunks the K tile is loaded and consumed
+            in (see FlashAttentionForwardSm90). None picks it via _sm90_k_chunks.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
@@ -1439,6 +1464,17 @@ def _flash_attn_fwd(
         and not is_split_kv
     )
 
+    if arch // 10 != 9:
+        k_chunks = 1
+    elif k_chunks is None:
+        k_chunks = _sm90_k_chunks(
+            head_dim,
+            paged_kv_non_tma=page_size not in [None, tile_n],
+            use_block_sparsity=use_block_sparsity,
+            intra_wg_overlap=intra_wg_overlap,
+            fp8_kv_dequant=fp8_kv_dequant,
+        )
+
     # CuTe keeps stride-zero modes static when marking layouts dynamic.
     tensor_broadcast_patterns = tuple(
         get_broadcast_dims(tensor) if tensor is not None else None
@@ -1501,6 +1537,7 @@ def _flash_attn_fwd(
         kv_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
+        k_chunks,
         use_clc_scheduler,
         num_splits_dynamic is not None,
         virtual_batch_idx is not None,
@@ -1677,6 +1714,7 @@ def _flash_attn_fwd(
                 output_quant_key=output_quant_key if not is_split_kv else None,
                 kv_dtype=kv_dtype,  # K/V storage dtype (fp8)
                 fp8_kv_dequant=fp8_kv_dequant,
+                k_chunks=k_chunks,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:

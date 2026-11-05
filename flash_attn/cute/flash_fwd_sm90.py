@@ -60,6 +60,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         is_split_kv: bool = False,
         kv_dtype=None,
         fp8_kv_dequant: bool = False,
+        k_chunks: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -98,6 +99,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         self.cluster_shape_mn = (1, 1)
         assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
+        # k_chunks > 1: the K tile is TMA'd and consumed as k_chunks head-dim chunks, each with
+        # its own mbarrier, so QK can start on the first chunk and each chunk is refilled for
+        # the next KV block as soon as its WGMMAs retire. Meant for hdim > 256, where only one
+        # K/V stage fits in smem. Same accumulation order as k_chunks == 1 (bitwise equal).
+        assert k_chunks >= 1
+        self.k_chunks = k_chunks
+        if k_chunks > 1:
+            assert self.use_tma_KV and intra_wg_overlap and not fp8_kv_dequant, (
+                "k_chunks > 1 requires TMA K/V loads, intra_wg_overlap and no FP8 KV"
+            )
+            # K chunk c is pipeline_k stage c, waited on with the phase of the 1-stage
+            # K/V pipeline state.
+            assert self.num_stages == 1, "k_chunks > 1 requires num_stages == 1"
+            assert self.tile_hdim % (64 * k_chunks) == 0, (
+                f"head dim {self.tile_hdim} is not divisible into {k_chunks} chunks of 64*n"
+            )
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -166,7 +183,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
         # 1 stage * 2 for Q pipeline (full + empty), self.num_stages*2 for K, self.num_stages*2 for V,
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
-        mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+        # K: one full/empty pair per K chunk
+        mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * self.k_chunks * 2]
         mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
 
         if const_expr(self.fp8_kv_dequant):
@@ -332,6 +350,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.num_wg_mma
         ]
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
+        assert not (self.use_block_sparsity and self.k_chunks > 1), (
+            "k_chunks > 1 is not supported with block sparsity"
+        )
 
         self.use_scheduler_barrier = (
             (self.num_wg_mma >= 2 and self.tile_hdim <= 128)
@@ -358,10 +379,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # sQ holds the (possibly bf16) Q tensor as TMA'd; the fp16 compute view
                 # is an in-place recast (both are 2 bytes) -- see mma().
                 (self.q_dtype, (self.tile_m, self.tile_hdim), None),
+                # k_chunks > 1: (tile_n, hdim / k_chunks) per stage, stage c = K chunk c.
                 (
                     sK_dtype,
-                    (self.tile_n, self.tile_hdim),
-                    self.num_k_slots_fp8 if const_expr(self.fp8_kv_dequant) else self.num_stages,
+                    (self.tile_n, self.tile_hdim // self.k_chunks),
+                    self.num_k_slots_fp8
+                    if const_expr(self.fp8_kv_dequant)
+                    else self.num_stages * self.k_chunks,
                 ),
                 (sV_dtype, (self.tile_n, self.tile_hdimv), self.num_stages),
                 # sO uses the output dtype (o_dtype); for splitkv o_dtype == compute dtype
@@ -444,7 +468,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 gmem_tiled_copy_KV,
                 mK,
                 sK_tma_box,
-                (self.tile_n, self.tile_hdim),
+                (self.tile_n, self.tile_hdim // self.k_chunks),
                 1,  # No mcast for now
             )
             tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
@@ -674,9 +698,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 defer_sync=True,
             )
         elif const_expr(self.use_tma_KV):
+            # One pipeline stage per K chunk; tx_count is the bytes of one chunk.
             pipeline_k = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=storage.mbar_ptr_K.data_ptr(),
-                num_stages=self.num_stages,
+                num_stages=self.num_stages * self.k_chunks,
                 producer_group=tma_warp,
                 consumer_group=mma_warps,
                 tx_count=self.tma_copy_bytes["K"],
@@ -1125,10 +1150,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
                         gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
                     # TODO: mcast
-                    tma_load_K_fn, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_K, 0, cute.make_layout(1), gK, sK
-                    )
-                    tma_load_K_fn = copy_utils.tma_producer_copy_fn(tma_load_K_fn, pipeline_k)
+                    if const_expr(self.k_chunks == 1):
+                        tma_load_K_fn, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_K, 0, cute.make_layout(1), gK, sK
+                        )
+                        tma_load_K_fn = copy_utils.tma_producer_copy_fn(tma_load_K_fn, pipeline_k)
+                    else:
+                        # One TMA copy per head-dim chunk of K; chunk c lands in sK stage c.
+                        hdim_chunk = self.tile_hdim // self.k_chunks
+                        tma_load_K_chunk_fns = []
+                        for c in cutlass.range_constexpr(self.k_chunks):
+                            # (tile_n, hdim_chunk, n_block), or (tile_n, hdim_chunk, page) if paged
+                            gK_c = cute.local_tile(
+                                mK_cur,
+                                (self.tile_n, hdim_chunk),
+                                (0, c, None) if const_expr(mPageTable is not None) else (None, c),
+                            )
+                            tma_load_K_c, _, _ = copy_utils.tma_get_copy_fn(
+                                tma_atom_K, 0, cute.make_layout(1), gK_c, sK
+                            )
+                            tma_load_K_chunk_fns.append(tma_load_K_c)
+                        tma_load_K_fn = partial(
+                            self.tma_load_K_chunks, tma_load_K_chunk_fns, pipeline_k
+                        )
                     tma_load_V_fn, _, _ = copy_utils.tma_get_copy_fn(
                         tma_atom_V, 0, cute.make_layout(1), gV, sV
                     )
@@ -1213,7 +1257,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
                     # First iteration: load K on pipeline_k, Q on pipeline_q
                     if is_kv_load_warp:
-                        pipeline_k.producer_acquire(kv_producer_state)
+                        if const_expr(self.k_chunks == 1):  # K chunks are acquired in load_K
+                            pipeline_k.producer_acquire(kv_producer_state)
                         if const_expr(not self.use_tma_KV):
                             paged_kv_manager.load_page_table(n_block)
                         load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
@@ -1276,7 +1321,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 )
                                 kv_producer_state_prev = kv_producer_state.clone()
                                 kv_producer_state.advance()
-                                pipeline_k.producer_acquire(kv_producer_state)
+                                if const_expr(self.k_chunks == 1):
+                                    pipeline_k.producer_acquire(kv_producer_state)
                                 load_K(
                                     block=n_block,
                                     producer_state=kv_producer_state,
@@ -1364,6 +1410,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_kv.producer_commit(producer_state)
 
     @cute.jit
+    def tma_load_K_chunks(
+        self,
+        tma_load_K_chunk_fns: list,
+        pipeline_k: pipeline.PipelineAsync,
+        src_idx: Int32,
+        producer_state: pipeline_custom.PipelineStateSimple,
+    ):
+        """k_chunks > 1: acquire and TMA each K chunk separately (pipeline_k stage c = chunk c),
+        so chunk c is refilled as soon as the consumer has released it."""
+        for c in cutlass.range_constexpr(self.k_chunks):
+            pipeline_k.producer_acquire_w_index_phase(c, producer_state.phase)
+            tma_load_K_chunk_fns[c](
+                src_idx=src_idx, dst_idx=c, tma_bar_ptr=pipeline_k.sync_object_full.get_barrier(c)
+            )
+
+    @cute.jit
     def mma(
         self,
         tiled_mma_qk: cute.TiledMma,
@@ -1426,6 +1488,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 tSrQ,
                 tSrK,
             )
+        elif const_expr(self.k_chunks > 1):
+            mma_qk_fn = partial(self.gemm_qk_k_chunks, tiled_mma_qk, tSrQ, tSrK, pipeline_k)
         else:
             mma_qk_fn = partial(
                 sm90_utils.gemm_zero_init,
@@ -1938,9 +2002,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     ):
         """Processes the first half block when using intra-warpgroup-overlap"""
 
-        pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
-        acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
-        pipeline_k.consumer_release(kv_consumer_state)
+        if const_expr(self.k_chunks == 1):
+            pipeline_k.consumer_wait(
+                kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state)
+            )
+            acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
+            pipeline_k.consumer_release(kv_consumer_state)
+        else:
+            acc_S = mma_qk_fn(phase=kv_consumer_state.phase)
+            self.release_K_chunks(pipeline_k, num_younger_groups=0)
 
         # Apply score modification if present
         if const_expr(score_mod_fn is not None):
@@ -2473,10 +2543,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     ):
         smem_pipe_read_v = smem_pipe_read.clone()
         smem_pipe_read.advance()
-        pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+        if const_expr(self.k_chunks == 1):
+            pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # S = Q @ K.T
-        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        if const_expr(self.k_chunks == 1):
+            acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        else:
+            acc_S = mma_qk_fn(phase=smem_pipe_read.phase)
         # RescaleOBeforeGemm: rescale O while QK GEMM is in flight, before PV GEMM
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
@@ -2484,8 +2558,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
-        warpgroup.wait_group(1)
-        pipeline_k.consumer_release(smem_pipe_read)
+        if const_expr(self.k_chunks == 1):
+            warpgroup.wait_group(1)
+            pipeline_k.consumer_release(smem_pipe_read)
+        else:
+            # The PV group committed after the QK chunks may stay in flight.
+            self.release_K_chunks(pipeline_k, num_younger_groups=1)
 
         # handle score mods and masking
         if const_expr(score_mod_fn is not None):
@@ -2596,6 +2674,51 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.rescale_O_before_gemm):
             scores_scale.store(row_scale.load())
         return smem_pipe_read
+
+    @cute.jit
+    def gemm_qk_k_chunks(
+        self,
+        tiled_mma_qk: cute.TiledMma,
+        tSrQ: cute.Tensor,  # (MMA, MMA_M, MMA_K)
+        tSrK: cute.Tensor,  # (MMA, MMA_N, MMA_K / k_chunks, k_chunks)
+        pipeline_k: pipeline.PipelineAsync,
+        phase: Int32,
+    ) -> cute.Tensor:
+        """S = Q @ K.T with K split into k_chunks head-dim chunks (pipeline_k stage c = chunk c).
+        Waits for each chunk right before its WGMMAs and commits each chunk as its own group,
+        so release_K_chunks can free chunk c once its group retires. The WGMMAs are issued in
+        the same order as the unchunked GEMM, so S is bitwise identical."""
+        acc_S = cute.make_rmem_tensor(
+            tiled_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
+        )
+        k_per_chunk = const_expr(cute.size(tSrK.shape[2]))
+        assert cute.size(tSrQ.shape[2]) == k_per_chunk * self.k_chunks
+        warpgroup.fence()
+        mma_atom = cute.make_mma_atom(tiled_mma_qk.op)
+        mma_atom.set(warpgroup.Field.ACCUMULATE, False)
+        for c in cutlass.range_constexpr(self.k_chunks):
+            pipeline_k.consumer_wait_w_index_phase(c, phase)
+            for k in cutlass.range_constexpr(k_per_chunk):
+                cute.gemm(
+                    mma_atom,
+                    acc_S,
+                    tSrQ[None, None, c * k_per_chunk + k],
+                    tSrK[None, None, k, c],
+                    acc_S,
+                )
+                mma_atom.set(warpgroup.Field.ACCUMULATE, True)
+            warpgroup.commit_group()
+        return acc_S
+
+    @cute.jit
+    def release_K_chunks(
+        self, pipeline_k: pipeline.PipelineAsync, num_younger_groups: cutlass.Constexpr[int]
+    ):
+        """Release K chunk c as soon as its QK WGMMA group has retired. num_younger_groups
+        WGMMA groups committed after the last QK chunk (e.g. PV) may stay in flight."""
+        for c in cutlass.range_constexpr(self.k_chunks):
+            warpgroup.wait_group(self.k_chunks - 1 - c + num_younger_groups)
+            pipeline_k.consumer_release_w_index(c)
 
     @cute.jit
     def cross_wg_p_barrier(self):
